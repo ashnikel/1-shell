@@ -152,3 +152,6 @@ Temporary Items
 # Assignment 1 specific
 ttywrite/input
 ttywrite/output
+
+# VS code
+**/.vscode/*

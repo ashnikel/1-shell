@@ -128,13 +128,13 @@ impl<'a, T: 'a> Deref for StackVec<'a, T> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
-        &self.storage
+        &self.as_slice()
     }
 }
 
 impl<'a, T: 'a> DerefMut for StackVec<'a, T> {
     fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.storage
+        self.as_mut_slice()
     }
 }
 
@@ -152,7 +152,6 @@ impl<'a, T: 'a> IntoIterator for &'a StackVec<'a, T> {
     type IntoIter = Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        // self.as_mut_slice().iter()
-        self.storage[..self.len].iter()
+        self.as_slice().iter()
     }
 }
