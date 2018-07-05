@@ -173,12 +173,8 @@ impl<T: io::Read + io::Write> Xmodem<T> {
     /// byte was not `byte`, if the read byte was `CAN` and `byte` is not `CAN`,
     /// or if writing the `CAN` byte failed on byte mismatch.
     fn expect_byte_or_cancel(&mut self, byte: u8, msg: &'static str) -> io::Result<u8> {
-        match self.read_byte(true) {
-            Ok(n) if n == byte => Ok(n),
-            Ok(_) => {
-                self.write_byte(CAN)?;
-                Err(io::Error::new(io::ErrorKind::InvalidData, msg))
-            }
+        match self.expect_byte(byte, msg) {
+            Ok(byte) => Ok(byte),
             Err(e) => {
                 self.write_byte(CAN)?;
                 Err(e)
@@ -200,9 +196,9 @@ impl<T: io::Read + io::Write> Xmodem<T> {
     fn expect_byte(&mut self, byte: u8, expected: &'static str) -> io::Result<u8> {
         match self.read_byte(false) {
             Ok(n) if n == byte => Ok(n),
-            Ok(CAN) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "received CAN")),
-            Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, expected)),
-            Err(e) => Err(e)
+            Ok(CAN) => Err(io::Error::new(io::ErrorKind::ConnectionAborted,
+                                          "received CAN")),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, expected)),
         }
     }
 
@@ -230,45 +226,57 @@ impl<T: io::Read + io::Write> Xmodem<T> {
     ///
     /// An error of kind `UnexpectedEof` is returned if `buf.len() < 128`.
     pub fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // started?
-        self.write_byte(NAK)?;
+        if buf.len() < 128 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                                     "Buffer length must be 128 bytes"));
+        }
+
+        if !self.started {
+            self.write_byte(NAK)?;
+            (self.progress)(Progress::Started);
+            self.started = true;
+        }
+
         match self.read_byte(true) {
             Ok(SOH) => {
                 //check packet number
-                let packet_num = self.read_byte(true)?;
-                if packet_num != self.packet + 1 {
-                    self.write_byte(CAN)?;
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                "Packet number mismatch"));
-                }
-                let rev_packet_num = self.read_byte(true)?;
-                if rev_packet_num != 255 - packet_num {
-                    self.write_byte(CAN)?;
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                "Complement packet number mismatch"));
-                }
+                let cur_packet = self.packet;
+                self.expect_byte_or_cancel(cur_packet, "Packet number mismatch")?;
+                self.expect_byte_or_cancel(255 - cur_packet,
+                                          "Complement packet number mismatch")?;
 
                 self.inner.read_exact(buf)?;
 
+                if buf.len() != 128 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                                      "Buffer length must be 128 bytes"));
+                }
                 let mut sum: u16 = 0;
                 for &byte in buf.iter() {
                     sum += byte as u16;
                 }
-                let checksum = sum % 256;
+                let checksum = (sum % 256) as u8;
 
-                if checksum == self.read_byte(true)? as u16 {
-                    self.write_byte(ACK)?;
-                    return Ok(128);
-                } else {
-                    self.write_byte(NAK)?;
-                    return Err(io::Error::new(io::ErrorKind::Interrupted,
+                match self.expect_byte(checksum, "checksum mismatch") {
+                    Ok(_) => {
+                        self.write_byte(ACK)?;
+                        (self.progress)(Progress::Packet(self.packet));
+                        self.packet += 1;
+                        return Ok(128);
+                    }
+                    _ => {
+                        self.write_byte(NAK)?;
+                        return Err(io::Error::new(io::ErrorKind::Interrupted,
                                               "Checksum error"));
+                    }
                 }
             }
             Ok(EOT) => {
                 self.write_byte(NAK)?;
                 self.expect_byte(EOT, "EOT expected")?;
                 self.write_byte(ACK)?;
+                (self.progress)(Progress::Packet(self.packet));
+                self.started = false;
                 Ok(0)
             }
             Ok(CAN) => Err(io::Error::new(io::ErrorKind::ConnectionAborted,
@@ -310,13 +318,17 @@ impl<T: io::Read + io::Write> Xmodem<T> {
     ///
     /// An error of kind `Interrupted` is returned if a packet checksum fails.
     pub fn write_packet(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.len() < 128 | buf.len() != 0 {
+        if buf.len() < 128 && buf.len() != 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
                                       "Unexpected EOF"));
         }
-
-        self.progress(Progress::Waiting);
-        self.expect_byte(NAK, "NAK expected")?;
+        // Beginning of transmission
+        if !self.started {
+            (self.progress)(Progress::Waiting);
+            self.expect_byte(NAK, "NAK expected")?;
+            (self.progress)(Progress::Started);
+            self.started = true;
+        }
 
         // End of transmission
         if buf.len() == 0 {
@@ -324,21 +336,42 @@ impl<T: io::Read + io::Write> Xmodem<T> {
             self.expect_byte(NAK, "NAK expected")?;
             self.write_byte(EOT)?;
             self.expect_byte(ACK, "ACK expected")?;
+
+            (self.progress)(Progress::Packet(self.packet));
+            self.started = false;
             return Ok(0)
         }
 
-        let cur_packet = if self.packet == 255 {
-            0
-        } else {
-            self.packet + 1
-        }
+        let cur_packet = self.packet;
 
         self.write_byte(SOH)?;
         self.write_byte(cur_packet)?;
-        // TODO Can be CAN'ed here
         self.write_byte(255 - cur_packet)?;
-        // TODO Can be CAN'ed here
 
+        let mut sum: u16 = 0;
+        for &byte in buf.iter() {
+            self.write_byte(byte)?;
+            sum += byte as u16;
+        }
+        let checksum = sum % 256;
+
+        self.write_byte(checksum as u8)?;
+
+        match self.read_byte(true) {
+            Ok(ACK) => {
+                (self.progress)(Progress::Packet(self.packet));
+                self.packet = if self.packet == 255 {
+                    0
+                } else {
+                    self.packet + 1
+                };
+                Ok(buf.len())
+            },
+            Ok(NAK) => return Err(io::Error::new(io::ErrorKind::Interrupted, "NAK received")),
+            Ok(CAN) => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "CAN received")),
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "ACK or NAK expected")),
+            Err(e) => Err(e),
+        }
     }
 
     /// Flush this output stream, ensuring that all intermediately buffered
