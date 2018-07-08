@@ -47,6 +47,10 @@ struct Opt {
     raw: bool,
 }
 
+fn progress_fn(progress: Progress) {
+    println!("Progress: {:?}", progress);
+}
+
 fn main() {
     use std::fs::File;
     use std::io::{self, BufReader, BufRead};
@@ -54,5 +58,42 @@ fn main() {
     let opt = Opt::from_args();
     let mut serial = serial::open(&opt.tty_path).expect("path points to invalid TTY");
 
-    // FIXME: Implement the `ttywrite` utility.
+    let mut settings = serial.read_settings().expect("can not read TTY settings");
+    settings.set_baud_rate(opt.baud_rate).expect("unsupported baud rate");
+    settings.set_char_size(opt.char_width);
+    settings.set_stop_bits(opt.stop_bits);
+    settings.set_flow_control(opt.flow_control);
+    serial.write_settings(&settings).expect("can not write TTY settings");
+    serial.set_timeout(Duration::from_secs(opt.timeout)).expect("can not set timeout");
+
+    let result = match opt.input {
+        Some(path) => {
+            let file = File::open(path.as_path()).unwrap();
+            let mut buffer = BufReader::new(file);
+
+            if opt.raw == true {
+                let bytes = io::copy(&mut buffer, &mut serial).unwrap();
+                Ok(bytes as usize)
+            } else {
+                Xmodem::transmit_with_progress(buffer, serial, progress_fn)
+            }
+        }
+        None => {
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            let mut buffer = BufReader::new(stdin);
+
+            if opt.raw == true {
+                let bytes = io::copy(&mut buffer, &mut serial).unwrap();
+                Ok(bytes as usize)
+            } else {
+                Xmodem::transmit_with_progress(buffer, serial, progress_fn)
+            }
+        }
+    };
+
+    match result {
+        Ok(bytes) => println!("{} bytes transmitted.", bytes),
+        Err(e) => println!("Error: {}", e),
+    }
 }
