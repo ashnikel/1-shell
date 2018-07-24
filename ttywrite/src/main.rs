@@ -48,7 +48,14 @@ struct Opt {
 }
 
 fn progress_fn(progress: Progress) {
-    println!("Progress: {:?}", progress);
+    use std::io::Write;
+    match progress {
+        Progress::Packet(_) => {
+            print!("#");
+            std::io::stdout().flush().unwrap();
+        }
+        _ => println!("Progress: {:?}", progress),
+    }
 }
 
 fn main() {
